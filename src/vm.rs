@@ -119,6 +119,74 @@ impl VmConfig {
     }
 }
 
+/// Does a `/proc/<pid>/cmdline` belong to *this* VM's Firecracker process?
+///
+/// This is the guard that makes signalling a persisted PID safe. A PID read
+/// from a file outlives the process it named: by the time `destroy` runs, the
+/// number may have been recycled onto something else entirely, and `monoce-os`
+/// runs as root. So the answer is "no" unless the cmdline positively identifies
+/// Firecracker serving *this VM's* API socket.
+///
+/// `/proc/<pid>/cmdline` is the raw argv, NUL-separated.
+pub fn cmdline_matches_vm(cmdline: &str, socket_path: &str) -> bool {
+    if socket_path.is_empty() {
+        return false;
+    }
+
+    let argv: Vec<&str> = cmdline.split('\0').filter(|s| !s.is_empty()).collect();
+    let Some(exe) = argv.first() else {
+        // Empty cmdline: a zombie, or a kernel thread. Not ours.
+        return false;
+    };
+
+    let is_firecracker = std::path::Path::new(exe)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .is_some_and(|f| f == "firecracker");
+    if !is_firecracker {
+        return false;
+    }
+
+    // Both spellings, so a Firecracker invoked as `--api-sock=<path>` by some
+    // future caller is still recognised as ours rather than silently skipped.
+    argv.windows(2)
+        .any(|w| w[0] == "--api-sock" && w[1] == socket_path)
+        || argv
+            .iter()
+            .any(|a| a.strip_prefix("--api-sock=") == Some(socket_path))
+}
+
+/// Read `/proc/<pid>/cmdline`, or `None` where there is no procfs.
+///
+/// Only Linux hosts run Firecracker; on every other platform this returns
+/// `None`, which callers treat as "cannot confirm" and therefore "do not
+/// signal".
+fn read_proc_cmdline(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read(format!("/proc/{}/cmdline", pid)).ok()?;
+        Some(String::from_utf8_lossy(&raw).into_owned())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Send a signal, treating "no such process" as success.
+fn signal_pid(pid: u32, sig: i32) -> OsResult<()> {
+    let ret = unsafe { libc::kill(pid as i32, sig) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        // ESRCH means the process is already gone — the outcome we wanted.
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            return Err(OsError::Io(err));
+        }
+    }
+    Ok(())
+}
+
 /// Represents a live or defined microVM instance.
 #[derive(Debug)]
 pub struct MicroVm {
@@ -130,18 +198,74 @@ pub struct MicroVm {
     pub socket_path: PathBuf,
     /// Log file path.
     pub log_path: PathBuf,
+    /// Path to the persisted PID file, so a later process can find the PID.
+    pid_path: PathBuf,
+    /// Handle to the spawned Firecracker process, held only for the lifetime of
+    /// the spawning call so a failed create can kill exactly the child it
+    /// started. It is deliberately *not* used for the normal stop path: the VM
+    /// outlives this process, and `destroy` runs in a different one.
+    child: Option<tokio::process::Child>,
 }
 
 impl MicroVm {
     pub fn new(config: VmConfig, storage: &VmStorage) -> Self {
         let socket_path = storage.socket_path(&config.vm_id);
         let log_path = storage.log_path(&config.vm_id);
+        let pid_path = storage.pid_path(&config.vm_id);
         Self {
             config,
             state: VmState::Created,
             pid: None,
             socket_path,
             log_path,
+            pid_path,
+            child: None,
+        }
+    }
+
+    /// The persisted PID, but only if the process it names is still this VM's
+    /// Firecracker.
+    ///
+    /// Returns `None` on any doubt at all — no PID file, unreadable,
+    /// unparseable, process gone, cmdline mismatch, or no procfs to check
+    /// against. Callers must treat `None` as "do not signal".
+    pub fn validated_pid(&self) -> Option<u32> {
+        let pid: u32 = std::fs::read_to_string(&self.pid_path)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        if pid == 0 {
+            return None;
+        }
+
+        let cmdline = read_proc_cmdline(pid)?;
+        let socket = self.socket_path.to_str()?;
+        if cmdline_matches_vm(&cmdline, socket) {
+            Some(pid)
+        } else {
+            tracing::warn!(
+                vm_id = %self.config.vm_id,
+                pid,
+                "persisted PID does not look like this VM's Firecracker; refusing to signal it"
+            );
+            None
+        }
+    }
+
+    /// Kill the child this process spawned, if any.
+    ///
+    /// Safe to call unconditionally: it signals a `Child` handle we still own,
+    /// so there is no window in which the PID could have been recycled.
+    pub async fn kill_spawned_child(&mut self) {
+        if let Some(mut child) = self.child.take()
+            && let Err(e) = child.kill().await
+        {
+            tracing::warn!(
+                vm_id = %self.config.vm_id,
+                error = %e,
+                "failed to kill spawned Firecracker child"
+            );
         }
     }
 
@@ -183,6 +307,13 @@ impl MicroVm {
         }
 
         // Spawn Firecracker process.
+        //
+        // `kill_on_drop` is deliberately NOT set. Every `monoce-os` invocation
+        // is a separate short-lived process (CLAUDE.md gotcha 7), so the child
+        // handle is dropped moments after a *successful* boot — killing on drop
+        // would tear down every VM the moment `create` returned. The failure
+        // paths are covered explicitly by `kill_spawned_child`, which signals a
+        // handle we still own rather than a number that may have been recycled.
         let child = tokio::process::Command::new(&self.config.firecracker_bin)
             .arg("--api-sock")
             .arg(&self.socket_path)
@@ -192,6 +323,13 @@ impl MicroVm {
             .map_err(|e| OsError::Firecracker(format!("failed to spawn: {}", e)))?;
 
         self.pid = child.id();
+        self.child = Some(child);
+
+        // Persist the PID before anything else can fail: a later `destroy`
+        // runs in a different process and has no other way to find it.
+        if let Some(pid) = self.pid {
+            tokio::fs::write(&self.pid_path, pid.to_string()).await?;
+        }
 
         // Wait for socket to appear.
         self.wait_for_socket(5).await?;
@@ -215,22 +353,76 @@ impl MicroVm {
         Ok(())
     }
 
-    /// Stop the microVM by sending InstanceHalt.
+    /// Stop the microVM, escalating until the process is confirmed gone.
+    ///
+    /// `SendCtrlAltDel` → `SIGTERM` → `SIGKILL`, each followed by a bounded
+    /// wait. A minimal Alpine rootfs without `acpid` ignores Ctrl-Alt-Del
+    /// entirely, so the signal escalation is the path that actually works.
+    ///
+    /// Every signal targets a freshly re-validated PID; if validation ever
+    /// fails the escalation stops rather than signalling blind.
     pub async fn stop(&mut self) -> OsResult<()> {
         self.transition(VmState::Stopping)?;
 
-        if let Err(e) = self.send_action("SendCtrlAltDel").await {
-            tracing::warn!(vm_id = %self.config.vm_id, error = %e, "graceful stop failed, killing");
-            self.kill()?;
+        // On the destroy path this `MicroVm` was rebuilt from disk, so the
+        // in-memory PID is None. The persisted one is the only one there is.
+        if self.pid.is_none() {
+            self.pid = self.validated_pid();
         }
 
-        // Wait a bit for process to exit, then force-kill if needed.
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let _ = self.kill();
+        if let Err(e) = self.send_action("SendCtrlAltDel").await {
+            tracing::warn!(vm_id = %self.config.vm_id, error = %e, "graceful stop failed, escalating");
+        }
+
+        for (sig, name, wait_secs) in [
+            (0, "graceful", 3u64),
+            (libc::SIGTERM, "SIGTERM", 3),
+            (libc::SIGKILL, "SIGKILL", 2),
+        ] {
+            if sig != 0 {
+                // Re-validate on every round: this is the only thing standing
+                // between a stale PID file and a root-signalled bystander.
+                let Some(pid) = self.validated_pid() else {
+                    break;
+                };
+                tracing::warn!(vm_id = %self.config.vm_id, pid, signal = name, "escalating stop");
+                signal_pid(pid, sig)?;
+            }
+
+            if self.wait_for_exit(wait_secs).await {
+                self.transition(VmState::Stopped)?;
+                tracing::info!(vm_id = %self.config.vm_id, "microVM stopped");
+                return Ok(());
+            }
+        }
+
+        if let Some(pid) = self.validated_pid() {
+            return Err(OsError::Firecracker(format!(
+                "VM {} still running as pid {} after SIGKILL",
+                self.config.vm_id, pid
+            )));
+        }
 
         self.transition(VmState::Stopped)?;
         tracing::info!(vm_id = %self.config.vm_id, "microVM stopped");
         Ok(())
+    }
+
+    /// Poll until the VM's Firecracker process can no longer be confirmed
+    /// alive. Returns `false` if it is still confirmably alive at the deadline.
+    async fn wait_for_exit(&self, timeout_secs: u64) -> bool {
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+        loop {
+            if self.validated_pid().is_none() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// Pause the microVM.
@@ -243,21 +435,6 @@ impl MicroVm {
     pub async fn resume(&mut self) -> OsResult<()> {
         self.send_action("Resume").await?;
         self.transition(VmState::Running)
-    }
-
-    /// Force-kill the Firecracker process.
-    fn kill(&self) -> OsResult<()> {
-        if let Some(pid) = self.pid {
-            let ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-            if ret != 0 {
-                let err = std::io::Error::last_os_error();
-                // ESRCH means process doesn't exist — that's fine
-                if err.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(OsError::Io(err));
-                }
-            }
-        }
-        Ok(())
     }
 
     async fn wait_for_socket(&self, timeout_secs: u64) -> OsResult<()> {
@@ -440,6 +617,113 @@ mod tests {
             let json = serde_json::to_string(&state).unwrap();
             let restored: VmState = serde_json::from_str(&json).unwrap();
             assert_eq!(state, restored);
+        }
+    }
+
+    /// Build the NUL-separated argv that `/proc/<pid>/cmdline` would hold.
+    fn proc_cmdline(argv: &[&str]) -> String {
+        let mut s = argv.join("\0");
+        s.push('\0'); // procfs terminates the last argument too
+        s
+    }
+
+    const SOCK: &str = "/var/lib/monoce-os/vms/vm-1/firecracker.sock";
+
+    #[test]
+    fn cmdline_accepts_this_vms_firecracker() {
+        assert!(cmdline_matches_vm(
+            &proc_cmdline(&["/usr/bin/firecracker", "--api-sock", SOCK]),
+            SOCK
+        ));
+        // Bare binary name, and the `=` spelling.
+        assert!(cmdline_matches_vm(
+            &proc_cmdline(&["firecracker", "--api-sock", SOCK]),
+            SOCK
+        ));
+        assert!(cmdline_matches_vm(
+            &proc_cmdline(&["firecracker", &format!("--api-sock={}", SOCK)]),
+            SOCK
+        ));
+    }
+
+    #[test]
+    fn cmdline_rejects_another_vms_firecracker() {
+        // The recycled-PID hazard this guard exists for: a real Firecracker,
+        // but serving a different VM.
+        let other = "/var/lib/monoce-os/vms/vm-2/firecracker.sock";
+        assert!(!cmdline_matches_vm(
+            &proc_cmdline(&["/usr/bin/firecracker", "--api-sock", other]),
+            SOCK
+        ));
+    }
+
+    #[test]
+    fn cmdline_rejects_unrelated_processes() {
+        for argv in [
+            vec!["/usr/sbin/sshd", "-D"],
+            vec!["/bin/bash"],
+            // Right socket, wrong program — a grep-for-substring check would
+            // have accepted this one.
+            vec!["/bin/cat", SOCK],
+            // Firecracker without the socket argument at all.
+            vec!["/usr/bin/firecracker"],
+            // Socket path present but not as the value of --api-sock.
+            vec!["/usr/bin/firecracker", "--config-file", SOCK],
+            // A program merely *named* like a suffix match.
+            vec!["/usr/bin/not-firecracker", "--api-sock", SOCK],
+        ] {
+            assert!(
+                !cmdline_matches_vm(&proc_cmdline(&argv), SOCK),
+                "expected {argv:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn cmdline_rejects_empty_inputs() {
+        // A zombie has an empty cmdline.
+        assert!(!cmdline_matches_vm("", SOCK));
+        assert!(!cmdline_matches_vm("\0\0", SOCK));
+        // An unknown socket path must never match anything.
+        assert!(!cmdline_matches_vm(
+            &proc_cmdline(&["firecracker", "--api-sock", SOCK]),
+            ""
+        ));
+    }
+
+    #[test]
+    fn validated_pid_is_none_without_a_pid_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = VmStorage::new(tmp.path());
+        let vm = MicroVm::new(VmConfig::new("test"), &storage);
+        assert!(vm.validated_pid().is_none());
+    }
+
+    #[tokio::test]
+    async fn validated_pid_is_none_for_garbage_and_stale_pid_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = VmStorage::new(tmp.path());
+        let config = VmConfig::new("test");
+        let vm_id = config.vm_id.clone();
+        let vm = MicroVm::new(config, &storage);
+        storage.prepare_vm_dirs(&vm_id).await.unwrap();
+
+        for contents in [
+            "not-a-number",
+            "",
+            "0",
+            "-1",
+            // Almost certainly not a live Firecracker, and on a host where it
+            // *is* live it is not serving this VM's socket.
+            "1",
+        ] {
+            tokio::fs::write(storage.pid_path(&vm_id), contents)
+                .await
+                .unwrap();
+            assert!(
+                vm.validated_pid().is_none(),
+                "expected pid file {contents:?} to yield no signalable PID"
+            );
         }
     }
 

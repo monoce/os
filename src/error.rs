@@ -33,6 +33,13 @@ pub enum OsError {
     #[error("network configuration error: {0}")]
     Network(String),
 
+    #[error("invalid {kind} {value:?}: {reason}")]
+    InvalidId {
+        kind: &'static str,
+        value: String,
+        reason: &'static str,
+    },
+
     #[error("storage error: {0}")]
     Storage(String),
 

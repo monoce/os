@@ -41,15 +41,20 @@ fn default_storage() -> VmStorage {
     VmStorage::new(base)
 }
 
+/// Host capacity with every VM already on disk subtracted.
+///
+/// This must not report the host idle just because it is a fresh process:
+/// `reserve` is the only overcommit guard there is, and it can only work
+/// against a figure that accounts for VMs created by earlier invocations.
+/// `HostCapacity::derive_from_dir` reads `vms/*/vm-config.json` to get it.
 fn default_capacity() -> HostCapacity {
-    HostCapacity {
-        total_vcpus: num_cpus(),
-        available_vcpus: num_cpus(),
-        total_memory_mib: total_memory_mib(),
-        available_memory_mib: total_memory_mib(),
-        total_disk_bytes: 100 * 1024 * 1024 * 1024,
-        available_disk_bytes: 100 * 1024 * 1024 * 1024,
-    }
+    let storage = default_storage();
+    HostCapacity::derive_from_dir(
+        &storage.vms_dir(),
+        num_cpus(),
+        total_memory_mib(),
+        total_disk_bytes(&storage.vms_dir()),
+    )
 }
 
 fn default_manager() -> VmManager {
@@ -65,6 +70,10 @@ async fn cmd_create(args: &[String]) -> Result<()> {
     let name = &args[0];
     let image_name = &args[1];
     let size = args.get(2).map(|s| s.as_str()).unwrap_or("small");
+
+    // The image name is interpolated into `images/<name>.ext4` below, so it
+    // must not be able to name a file outside that directory.
+    monoce_os::storage::validate_image_name(image_name)?;
 
     let resources = match size {
         "small" => ResourceLimits::small(),
@@ -137,6 +146,9 @@ async fn cmd_status(args: &[String]) -> Result<()> {
         eprintln!("usage: monoce-os status <vm-id>");
         std::process::exit(1);
     }
+
+    // `args[0]` reaches `base/vms/<arg>/vm-config.json` unfiltered otherwise.
+    monoce_os::storage::validate_vm_id(&args[0])?;
 
     let storage = default_storage();
     let config_path = storage.config_path(&args[0]);
@@ -213,6 +225,8 @@ fn print_help() {
     println!("ENVIRONMENT:");
     println!("  MONOCE_OS_DATA     Data directory (default: /var/lib/monoce-os)");
     println!("  MONOCE_OS_KERNEL   Kernel image path");
+    println!("  MONOCE_OS_TOTAL_DISK_BYTES");
+    println!("                     Disk budget for VMs (default: filesystem size)");
     println!("  RUST_LOG           Log level (default: info)");
 }
 
@@ -220,6 +234,64 @@ fn num_cpus() -> u32 {
     std::thread::available_parallelism()
         .map(|p| p.get() as u32)
         .unwrap_or(4)
+}
+
+/// Total bytes on the filesystem backing the data directory.
+///
+/// `MONOCE_OS_TOTAL_DISK_BYTES` overrides it, for hosts where the VM store is
+/// meant to use only part of the filesystem.
+fn total_disk_bytes(vms_dir: &std::path::Path) -> u64 {
+    const FALLBACK: u64 = 100 * 1024 * 1024 * 1024;
+
+    if let Ok(raw) = std::env::var("MONOCE_OS_TOTAL_DISK_BYTES") {
+        match raw.trim().parse::<u64>() {
+            Ok(bytes) if bytes > 0 => return bytes,
+            _ => tracing::warn!(
+                value = %raw,
+                "ignoring unparseable MONOCE_OS_TOTAL_DISK_BYTES"
+            ),
+        }
+    }
+
+    // statvfs needs a path that exists; the VM directory may not yet.
+    let mut probe = vms_dir;
+    while !probe.exists() {
+        match probe.parent() {
+            Some(parent) => probe = parent,
+            None => return FALLBACK,
+        }
+    }
+
+    statvfs_total_bytes(probe).unwrap_or_else(|| {
+        tracing::warn!(
+            path = %probe.display(),
+            "statvfs failed; falling back to a nominal disk total"
+        );
+        FALLBACK
+    })
+}
+
+/// Total size in bytes of the filesystem containing `path`, via `statvfs(3)`.
+fn statvfs_total_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+
+    // SAFETY: `c_path` is a valid NUL-terminated string and `stat` is a live,
+    // correctly sized, zeroed `statvfs` we own for the duration of the call.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+
+    // f_frsize is the fragment size f_blocks is counted in; some platforms
+    // leave it zero, in which case f_bsize is the right unit.
+    let unit = if stat.f_frsize != 0 {
+        stat.f_frsize as u64
+    } else {
+        stat.f_bsize as u64
+    };
+    (stat.f_blocks as u64).checked_mul(unit)
 }
 
 fn total_memory_mib() -> u64 {

@@ -182,6 +182,79 @@ pub struct HostCapacity {
 }
 
 impl HostCapacity {
+    /// Build capacity for a host by subtracting every VM already on disk.
+    ///
+    /// Each `monoce-os` invocation is a separate process, so there is no
+    /// in-memory reservation to inherit — availability has to be recovered
+    /// from `vms/<id>/vm-config.json`. Deriving it rather than persisting a
+    /// counter is self-healing: there is no tally that can drift from reality,
+    /// and a removed VM directory frees its resources by construction.
+    ///
+    /// Unreadable or malformed configs are skipped with a warning: refusing to
+    /// report capacity because one directory is corrupt would be worse than
+    /// slightly overstating it.
+    pub fn derive_from_dir(
+        vms_dir: &std::path::Path,
+        total_vcpus: u32,
+        total_memory_mib: u64,
+        total_disk_bytes: u64,
+    ) -> Self {
+        #[derive(Deserialize)]
+        struct ResourcesOnly {
+            resources: ResourceLimits,
+        }
+
+        let mut capacity = Self {
+            total_vcpus,
+            available_vcpus: total_vcpus,
+            total_memory_mib,
+            available_memory_mib: total_memory_mib,
+            total_disk_bytes,
+            available_disk_bytes: total_disk_bytes,
+        };
+
+        let Ok(entries) = std::fs::read_dir(vms_dir) else {
+            // No VM directory yet: the host is genuinely idle.
+            return capacity;
+        };
+
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let config_path = entry.path().join("vm-config.json");
+            let Ok(data) = std::fs::read_to_string(&config_path) else {
+                continue;
+            };
+            match serde_json::from_str::<ResourcesOnly>(&data) {
+                Ok(parsed) => capacity.subtract(&parsed.resources),
+                Err(e) => tracing::warn!(
+                    path = %config_path.display(),
+                    error = %e,
+                    "skipping unparseable VM config while deriving host capacity"
+                ),
+            }
+        }
+
+        capacity
+    }
+
+    /// Subtract a VM's resources, saturating at zero.
+    ///
+    /// Saturating rather than erroring: a host that was overcommitted before
+    /// this check existed should report "nothing available", not panic.
+    fn subtract(&mut self, limits: &ResourceLimits) {
+        self.available_vcpus = self
+            .available_vcpus
+            .saturating_sub(limits.cpu.vcpu_count as u32);
+        self.available_memory_mib = self
+            .available_memory_mib
+            .saturating_sub(limits.memory.size_mib);
+        self.available_disk_bytes = self
+            .available_disk_bytes
+            .saturating_sub(limits.storage.rootfs_size_bytes);
+    }
+
     /// Reserve resources for a VM, returning an error if insufficient.
     pub fn reserve(&mut self, limits: &ResourceLimits) -> crate::OsResult<()> {
         if !limits.fits_in(self) {
@@ -293,5 +366,96 @@ mod tests {
     fn swap_defaults_to_zero() {
         let mem = MemoryLimits::default();
         assert_eq!(mem.swap_limit_bytes, Some(0));
+    }
+
+    /// Write a `vms/<id>/vm-config.json` holding just the fields the derivation
+    /// reads.
+    fn write_vm_config(vms_dir: &std::path::Path, id: &str, limits: &ResourceLimits) {
+        let dir = vms_dir.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = serde_json::json!({
+            "vm_id": id,
+            "name": id,
+            "resources": limits,
+        });
+        std::fs::write(
+            dir.join("vm-config.json"),
+            serde_json::to_string(&config).unwrap(),
+        )
+        .unwrap();
+    }
+
+    const TOTAL_DISK: u64 = 100 * 1024 * 1024 * 1024;
+
+    #[test]
+    fn derived_capacity_is_full_when_no_vms_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cap = HostCapacity::derive_from_dir(&tmp.path().join("vms"), 8, 8192, TOTAL_DISK);
+        assert_eq!(cap.available_vcpus, 8);
+        assert_eq!(cap.available_memory_mib, 8192);
+        assert_eq!(cap.available_disk_bytes, TOTAL_DISK);
+    }
+
+    #[test]
+    fn derived_capacity_subtracts_on_disk_vms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vms_dir = tmp.path().join("vms");
+        let medium = ResourceLimits::medium(); // 2 vCPU, 512 MiB, 2 GiB
+        let large = ResourceLimits::large(); // 4 vCPU, 2048 MiB, 8 GiB
+        write_vm_config(&vms_dir, "vm-a", &medium);
+        write_vm_config(&vms_dir, "vm-b", &large);
+
+        let cap = HostCapacity::derive_from_dir(&vms_dir, 8, 8192, TOTAL_DISK);
+        assert_eq!(cap.total_vcpus, 8);
+        assert_eq!(cap.available_vcpus, 8 - 2 - 4);
+        assert_eq!(cap.available_memory_mib, 8192 - 512 - 2048);
+        assert_eq!(
+            cap.available_disk_bytes,
+            TOTAL_DISK
+                - medium.storage.rootfs_size_bytes
+                - large.storage.rootfs_size_bytes
+        );
+    }
+
+    #[test]
+    fn derived_capacity_skips_unparseable_configs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vms_dir = tmp.path().join("vms");
+        write_vm_config(&vms_dir, "vm-a", &ResourceLimits::medium());
+
+        // A half-written config, and a directory with no config at all.
+        std::fs::create_dir_all(vms_dir.join("vm-broken")).unwrap();
+        std::fs::write(vms_dir.join("vm-broken").join("vm-config.json"), "{not json").unwrap();
+        std::fs::create_dir_all(vms_dir.join("vm-empty")).unwrap();
+
+        let cap = HostCapacity::derive_from_dir(&vms_dir, 8, 8192, TOTAL_DISK);
+        assert_eq!(cap.available_vcpus, 6);
+        assert_eq!(cap.available_memory_mib, 8192 - 512);
+    }
+
+    #[test]
+    fn derived_capacity_saturates_when_overcommitted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vms_dir = tmp.path().join("vms");
+        for id in ["vm-a", "vm-b", "vm-c"] {
+            write_vm_config(&vms_dir, id, &ResourceLimits::large());
+        }
+
+        // Only 2 vCPUs and 1 GiB on the host, but 12 vCPUs already committed.
+        let cap = HostCapacity::derive_from_dir(&vms_dir, 2, 1024, TOTAL_DISK);
+        assert_eq!(cap.available_vcpus, 0);
+        assert_eq!(cap.available_memory_mib, 0);
+    }
+
+    #[test]
+    fn derived_capacity_rejects_a_new_vm_once_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vms_dir = tmp.path().join("vms");
+        write_vm_config(&vms_dir, "vm-a", &ResourceLimits::large());
+
+        // This is the whole point of BUG-03: a second `create large` on a
+        // 4-vCPU host must now fail rather than overcommit.
+        let mut cap = HostCapacity::derive_from_dir(&vms_dir, 4, 8192, TOTAL_DISK);
+        assert!(cap.reserve(&ResourceLimits::large()).is_err());
     }
 }

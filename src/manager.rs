@@ -104,6 +104,8 @@ impl VmManager {
         image_name: &str,
         resources: ResourceLimits,
     ) -> OsResult<VmId> {
+        crate::storage::validate_image_name(image_name)?;
+
         // Check image exists.
         let images = self.images.read().await;
         let image = images
@@ -115,7 +117,9 @@ impl VmManager {
         self.capacity.write().await.reserve(&resources)?;
 
         // Allocate network with file lock to prevent race conditions
-        // between concurrent processes.
+        // between concurrent processes. The lock is held across provisioning
+        // *and* any unwind, so teardown cannot delete a directory or TAP
+        // device a concurrent create has just claimed.
         let _lock = VmIndexLock::acquire(&self.storage)?;
         let vm_index = {
             // Re-detect from disk under lock to get accurate value
@@ -136,52 +140,124 @@ impl VmManager {
 
         let vm_id = config.vm_id.clone();
 
+        // Everything past this point creates state on the host — a rootfs
+        // copy, a VM directory, a TAP device, a Firecracker process. A bare
+        // `?` here would leak all of it, so the whole sequence runs behind a
+        // single unwind.
+        match self
+            .provision_and_start(&config, &resources, &image.rootfs_path)
+            .await
+        {
+            Ok(vm) => {
+                self.vms.write().await.insert(vm_id.clone(), vm);
+                tracing::info!(vm_id = %vm_id, name = %name, "VM created and started");
+                Ok(vm_id)
+            }
+            Err(e) => {
+                tracing::warn!(vm_id = %vm_id, error = %e, "VM create failed; unwinding");
+                self.unwind_failed_create(&config, &resources, vm_index).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Provision on-host state and boot the VM. Every failure is reported to
+    /// the caller, which owns the unwind.
+    async fn provision_and_start(
+        &self,
+        config: &VmConfig,
+        resources: &ResourceLimits,
+        rootfs_source: &std::path::Path,
+    ) -> OsResult<MicroVm> {
+        let vm_id = &config.vm_id;
+
         // Copy rootfs for this VM.
-        self.storage
-            .copy_base_image(&vm_id, &image.rootfs_path)
-            .await?;
+        self.storage.copy_base_image(vm_id, rootfs_source).await?;
 
         // Create data disk if configured.
         if let Some(data_size) = resources.storage.data_disk_size_bytes {
-            self.storage.create_data_disk(&vm_id, data_size).await?;
+            self.storage.create_data_disk(vm_id, data_size).await?;
         }
 
         // Save config.
-        let config_json = serde_json::to_string_pretty(&config)?;
-        tokio::fs::write(self.storage.config_path(&vm_id), config_json).await?;
+        let config_json = serde_json::to_string_pretty(config)?;
+        tokio::fs::write(self.storage.config_path(vm_id), config_json).await?;
 
         // Setup TAP.
         let tap = TapSetup::from_config(&config.network);
         tap.setup().await?;
 
         // Create and start VM.
-        let mut vm = MicroVm::new(config, &self.storage);
-        vm.start(&self.storage).await?;
+        let mut vm = MicroVm::new(config.clone(), &self.storage);
+        if let Err(e) = vm.start(&self.storage).await {
+            // Kill the child we just spawned, if we got that far. This uses
+            // the owned `Child` handle, so it cannot hit a recycled PID.
+            vm.kill_spawned_child().await;
+            return Err(e);
+        }
 
-        self.vms.write().await.insert(vm_id.clone(), vm);
+        Ok(vm)
+    }
 
-        tracing::info!(vm_id = %vm_id, name = %name, "VM created and started");
-        Ok(vm_id)
+    /// Undo everything `provision_and_start` may have done.
+    ///
+    /// Best-effort and idempotent throughout: unwinding must not itself fail
+    /// on a resource that was never created. Runs while `create_vm` still
+    /// holds the VM index lock.
+    async fn unwind_failed_create(
+        &self,
+        config: &VmConfig,
+        resources: &ResourceLimits,
+        vm_index: u32,
+    ) {
+        self.capacity.write().await.release(resources);
+
+        // `ip link del` on an absent device is already a no-op here.
+        let tap = TapSetup::from_config(&config.network);
+        if let Err(e) = tap.teardown().await {
+            tracing::warn!(vm_id = %config.vm_id, error = %e, "unwind: TAP teardown failed");
+        }
+
+        if let Err(e) = self.storage.cleanup_vm(&config.vm_id).await {
+            tracing::warn!(vm_id = %config.vm_id, error = %e, "unwind: storage cleanup failed");
+        }
+
+        // Hand the network index back so a retry in this process reuses it.
+        // Later processes reclaim it anyway via the on-disk scan, which no
+        // longer sees the removed directory.
+        let mut idx = self.next_vm_index.write().await;
+        if *idx == vm_index + 1 {
+            *idx = vm_index;
+        }
     }
 
     /// Stop and destroy a microVM.
     pub async fn destroy_vm(&self, vm_id: &str) -> OsResult<()> {
+        crate::storage::validate_vm_id(vm_id)?;
+
         // Try to take the VM from the in-memory registry first.
         let mut vm = {
             let mut vms = self.vms.write().await;
             if let Some(vm) = vms.remove(vm_id) {
                 vm
             } else {
-                // Fall back to loading the VM definition from disk.
+                // Fall back to loading the VM definition from disk. This is the
+                // normal case, not the exception: each CLI invocation is its own
+                // process, so the in-memory registry is always empty here.
                 let cfg_path = self.storage.config_path(vm_id);
                 if !cfg_path.exists() {
                     return Err(OsError::VmNotFound(vm_id.to_string()));
                 }
                 let cfg_data = tokio::fs::read_to_string(&cfg_path).await?;
                 let config: VmConfig = serde_json::from_str(&cfg_data)?;
+                // The config came off disk and drives `ip` arguments; reject a
+                // tampered one before it gets there.
+                config.network.validate()?;
                 let mut vm = MicroVm::new(config, &self.storage);
-                // If a Firecracker API socket exists, assume it's running so we can try to stop it.
-                if self.storage.socket_path(vm_id).exists() {
+                // Treat the VM as running if either the API socket is present or
+                // the persisted PID still resolves to this VM's Firecracker, so
+                // `stop` gets a chance to escalate.
+                if self.storage.socket_path(vm_id).exists() || vm.validated_pid().is_some() {
                     vm.state = VmState::Running;
                 }
                 vm
@@ -194,6 +270,17 @@ impl VmManager {
             if let Err(e) = vm.stop().await {
                 tracing::warn!(vm_id = %vm.config.vm_id, error = %e, "failed to stop VM during destroy; continuing");
             }
+        }
+
+        // Never unlink a rootfs from under a live VM. If the persisted PID
+        // still validates as this VM's Firecracker after the full escalation,
+        // stop here — leaving the directory in place is recoverable, deleting
+        // the backing store of a running VM is not.
+        if let Some(pid) = vm.validated_pid() {
+            return Err(OsError::Firecracker(format!(
+                "VM {} is still running as pid {}; refusing to remove its storage",
+                vm_id, pid
+            )));
         }
 
         // Release host resources.
@@ -330,5 +417,120 @@ mod tests {
         mgr.register_image(image).await;
         let images = mgr.images.read().await;
         assert!(images.get("test-img").is_some());
+    }
+
+    #[tokio::test]
+    async fn destroy_rejects_traversing_vm_id() {
+        let mgr = make_manager();
+        for bad in ["../../etc", "..", "vm-../../x", ""] {
+            assert!(
+                mgr.destroy_vm(bad).await.is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_traversing_image_name() {
+        let mgr = make_manager();
+        let err = mgr
+            .create_vm("test", "../../etc/shadow", ResourceLimits::small())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OsError::InvalidId { .. }),
+            "expected a validation error, got {err}"
+        );
+    }
+
+    /// Build a manager over a temp dir with a registered image whose kernel and
+    /// rootfs both exist, so `create_vm` gets past validation and actually
+    /// provisions before failing.
+    async fn manager_with_real_image(tmp: &std::path::Path) -> VmManager {
+        let images = tmp.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::write(images.join("vmlinux"), b"not-a-kernel").unwrap();
+        std::fs::write(images.join("base.ext4"), b"not-a-rootfs").unwrap();
+
+        let capacity = HostCapacity {
+            total_vcpus: 8,
+            available_vcpus: 8,
+            total_memory_mib: 8192,
+            available_memory_mib: 8192,
+            total_disk_bytes: 100 * 1024 * 1024 * 1024,
+            available_disk_bytes: 100 * 1024 * 1024 * 1024,
+        };
+        let mgr = VmManager::new(VmStorage::new(tmp), capacity);
+        mgr.register_image(VmImage::new(
+            "base",
+            images.join("vmlinux"),
+            images.join("base.ext4"),
+        ))
+        .await;
+        mgr
+    }
+
+    /// The Firecracker binary cannot exist here, so `create_vm` always fails at
+    /// spawn — which is exactly the late failure the unwind has to cover.
+    #[tokio::test]
+    async fn failed_create_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = manager_with_real_image(tmp.path()).await;
+
+        let before = mgr.host_capacity().await;
+        let err = mgr
+            .create_vm("doomed", "base", ResourceLimits::medium())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OsError::Firecracker(_)),
+            "expected a spawn failure, got {err}"
+        );
+
+        // Capacity released.
+        let after = mgr.host_capacity().await;
+        assert_eq!(after.available_vcpus, before.available_vcpus);
+        assert_eq!(after.available_memory_mib, before.available_memory_mib);
+        assert_eq!(after.available_disk_bytes, before.available_disk_bytes);
+
+        // Rootfs copy and VM directory removed — nothing to `list`, and the
+        // next capacity derivation will not count a phantom VM.
+        assert!(mgr.storage.list_vms().await.unwrap().is_empty());
+
+        // Nothing registered in memory either.
+        assert!(mgr.list_vms().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_create_hands_back_the_network_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = manager_with_real_image(tmp.path()).await;
+
+        for _ in 0..3 {
+            assert!(mgr
+                .create_vm("doomed", "base", ResourceLimits::small())
+                .await
+                .is_err());
+            // A leaked index would march tap0 -> tap1 -> tap2 and exhaust the
+            // 64-VM subnet after enough failed creates.
+            assert_eq!(*mgr.next_vm_index.read().await, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn unwind_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = manager_with_real_image(tmp.path()).await;
+        let config = VmConfig::new("never-provisioned");
+        let resources = ResourceLimits::small();
+
+        // Nothing was ever created: unwinding must not fail on the absent TAP
+        // device or the absent directory, and must be safe to repeat.
+        mgr.unwind_failed_create(&config, &resources, 0).await;
+        mgr.unwind_failed_create(&config, &resources, 0).await;
+
+        let cap = mgr.host_capacity().await;
+        assert_eq!(cap.available_vcpus, cap.total_vcpus);
+        assert_eq!(cap.available_memory_mib, cap.total_memory_mib);
     }
 }

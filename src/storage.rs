@@ -1,7 +1,68 @@
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use monoce_common::{Cid, Codec};
-use crate::error::OsResult;
+use crate::error::{OsError, OsResult};
+
+/// Length of a hyphenated UUID, the part of a VM ID that follows `vm-`.
+const UUID_LEN: usize = 36;
+
+/// Reject any VM ID that is not one this crate generated.
+///
+/// `VmConfig::new` always builds IDs as `vm-<hyphenated-uuid>`, so a strict
+/// pattern rejects nothing legitimate. It does reject the strings that would
+/// otherwise reach `remove_dir_all` and `File::open` by way of
+/// `base/vms/<vm_id>` — `..`, absolute paths, and anything with a separator.
+pub fn validate_vm_id(vm_id: &str) -> OsResult<()> {
+    let invalid = |reason: &'static str| {
+        Err(OsError::InvalidId {
+            kind: "VM ID",
+            value: vm_id.to_string(),
+            reason,
+        })
+    };
+
+    let Some(uuid) = vm_id.strip_prefix("vm-") else {
+        return invalid("must start with 'vm-'");
+    };
+    if uuid.len() != UUID_LEN {
+        return invalid("must be 'vm-' followed by a 36-character UUID");
+    }
+    if !uuid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        return invalid("UUID may only contain hex digits and hyphens");
+    }
+    Ok(())
+}
+
+/// Reject image names that would escape the images directory.
+///
+/// The name is interpolated into `images/<name>.ext4`, so a separator or `..`
+/// selects an arbitrary file on the host as a VM's base rootfs.
+pub fn validate_image_name(name: &str) -> OsResult<()> {
+    let invalid = |reason: &'static str| {
+        Err(OsError::InvalidId {
+            kind: "image name",
+            value: name.to_string(),
+            reason,
+        })
+    };
+
+    if name.is_empty() {
+        return invalid("must not be empty");
+    }
+    if name.contains('/') || name.contains('\\') {
+        return invalid("must not contain a path separator");
+    }
+    if name.starts_with('.') {
+        return invalid("must not start with '.'");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return invalid("may only contain alphanumerics, '.', '_' and '-'");
+    }
+    Ok(())
+}
 
 /// Manages on-disk storage for VM images, rootfs, and data disks.
 /// Integrates with Monoce CAS for content-addressable image storage.
@@ -77,6 +138,15 @@ impl VmStorage {
         self.vm_dir(vm_id).join("vm-config.json")
     }
 
+    /// Path to the file holding the Firecracker PID.
+    ///
+    /// The PID has to survive the process that spawned it: every `monoce-os`
+    /// invocation is a separate process, so `destroy` never inherits the live
+    /// `MicroVm` and would otherwise have nothing to signal.
+    pub fn pid_path(&self, vm_id: &str) -> PathBuf {
+        self.vm_dir(vm_id).join("firecracker.pid")
+    }
+
     /// Directory for cached kernel and base images.
     pub fn images_dir(&self) -> PathBuf {
         self.base_path.join("images")
@@ -88,14 +158,26 @@ impl VmStorage {
     }
 
     /// Ensure all required directories exist for a VM.
+    ///
+    /// The VM directory is created `0700`: it holds the rootfs, the API socket
+    /// and the PID file, none of which any other user needs.
     pub async fn prepare_vm_dirs(&self, vm_id: &str) -> OsResult<()> {
+        validate_vm_id(vm_id)?;
         let vm_dir = self.vm_dir(vm_id);
         tokio::fs::create_dir_all(&vm_dir).await?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&vm_dir, std::fs::Permissions::from_mode(0o700)).await?;
+        }
+
         Ok(())
     }
 
     /// Create a sparse rootfs image of the given size in bytes.
     pub async fn create_rootfs(&self, vm_id: &str, size_bytes: u64) -> OsResult<PathBuf> {
+        validate_vm_id(vm_id)?;
         let path = self.rootfs_path(vm_id);
         self.create_sparse_image(&path, size_bytes).await?;
         Ok(path)
@@ -103,6 +185,7 @@ impl VmStorage {
 
     /// Create a sparse data disk image.
     pub async fn create_data_disk(&self, vm_id: &str, size_bytes: u64) -> OsResult<PathBuf> {
+        validate_vm_id(vm_id)?;
         let path = self.data_disk_path(vm_id);
         self.create_sparse_image(&path, size_bytes).await?;
         Ok(path)
@@ -115,6 +198,7 @@ impl VmStorage {
         source: &Path,
     ) -> OsResult<PathBuf> {
         let dest = self.rootfs_path(vm_id);
+        // Validates `vm_id` before anything is written.
         self.prepare_vm_dirs(vm_id).await?;
         tokio::fs::copy(source, &dest).await?;
         Ok(dest)
@@ -221,6 +305,7 @@ impl VmStorage {
 
     /// Remove all storage for a VM.
     pub async fn cleanup_vm(&self, vm_id: &str) -> OsResult<()> {
+        validate_vm_id(vm_id)?;
         let vm_dir = self.vm_dir(vm_id);
         if vm_dir.exists() {
             tokio::fs::remove_dir_all(&vm_dir).await?;
@@ -344,23 +429,27 @@ mod tests {
         assert!(vms.is_empty());
     }
 
+    /// Two well-formed IDs of the shape `VmConfig::new` produces.
+    const VM_A: &str = "vm-00000000-0000-4000-8000-000000000001";
+    const VM_B: &str = "vm-00000000-0000-4000-8000-000000000002";
+
     #[tokio::test]
     async fn prepare_and_list_vms() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = VmStorage::new(tmp.path());
-        storage.prepare_vm_dirs("vm-a").await.unwrap();
-        storage.prepare_vm_dirs("vm-b").await.unwrap();
+        storage.prepare_vm_dirs(VM_A).await.unwrap();
+        storage.prepare_vm_dirs(VM_B).await.unwrap();
         let mut vms = storage.list_vms().await.unwrap();
         vms.sort();
-        assert_eq!(vms, vec!["vm-a", "vm-b"]);
+        assert_eq!(vms, vec![VM_A, VM_B]);
     }
 
     #[tokio::test]
     async fn create_sparse_rootfs() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = VmStorage::new(tmp.path());
-        storage.prepare_vm_dirs("vm-1").await.unwrap();
-        let path = storage.create_rootfs("vm-1", 1024 * 1024).await.unwrap();
+        storage.prepare_vm_dirs(VM_A).await.unwrap();
+        let path = storage.create_rootfs(VM_A, 1024 * 1024).await.unwrap();
         let meta = tokio::fs::metadata(&path).await.unwrap();
         assert_eq!(meta.len(), 1024 * 1024);
     }
@@ -369,9 +458,77 @@ mod tests {
     async fn cleanup_removes_vm_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = VmStorage::new(tmp.path());
-        storage.prepare_vm_dirs("vm-del").await.unwrap();
-        assert!(storage.vm_dir("vm-del").exists());
-        storage.cleanup_vm("vm-del").await.unwrap();
-        assert!(!storage.vm_dir("vm-del").exists());
+        storage.prepare_vm_dirs(VM_A).await.unwrap();
+        assert!(storage.vm_dir(VM_A).exists());
+        storage.cleanup_vm(VM_A).await.unwrap();
+        assert!(!storage.vm_dir(VM_A).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepared_vm_dir_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = VmStorage::new(tmp.path());
+        storage.prepare_vm_dirs(VM_A).await.unwrap();
+        let meta = tokio::fs::metadata(storage.vm_dir(VM_A)).await.unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn accepts_generated_vm_id() {
+        let generated = crate::vm::VmConfig::new("real").vm_id;
+        validate_vm_id(&generated).unwrap();
+        validate_vm_id(VM_A).unwrap();
+    }
+
+    #[test]
+    fn rejects_traversing_vm_id() {
+        for bad in [
+            "..",
+            "../../etc",
+            "vm-../../../etc/passwd",
+            "vm-/absolute",
+            "/etc",
+            "",
+            "vm-",
+            // Right shape, wrong alphabet — `z` is not a hex digit.
+            "vm-zzzzzzzz-0000-4000-8000-000000000001",
+            // Right alphabet, wrong length.
+            "vm-0000",
+        ] {
+            assert!(
+                validate_vm_id(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_refuses_traversing_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("vms").join("keep-me");
+        tokio::fs::create_dir_all(&victim).await.unwrap();
+
+        let storage = VmStorage::new(tmp.path().join("vms").join("base"));
+        // Would resolve to `<tmp>/vms/base/vms/../../keep-me` without the guard.
+        assert!(storage.cleanup_vm("../../keep-me").await.is_err());
+        assert!(victim.exists());
+    }
+
+    #[test]
+    fn accepts_plain_image_name() {
+        validate_image_name("monoce-node").unwrap();
+        validate_image_name("alpine_3.19").unwrap();
+    }
+
+    #[test]
+    fn rejects_traversing_image_name() {
+        for bad in ["", "..", "../vmlinux", "a/b", "a\\b", ".hidden", "img;rm"] {
+            assert!(
+                validate_image_name(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
     }
 }
