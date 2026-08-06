@@ -7,6 +7,7 @@ use monoce_os::VmManager;
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -76,13 +77,15 @@ async fn cmd_create(args: &[String]) -> Result<()> {
     };
 
     let manager = default_manager();
+    let images_dir = default_storage().images_dir();
 
-    // Try to load image from well-known paths.
+    // Try to load image from MONOCE_OS_DATA/images unless overridden.
     let kernel_path = std::env::var("MONOCE_OS_KERNEL")
-        .unwrap_or_else(|_| "/var/lib/monoce-os/images/vmlinux".to_string());
-    let rootfs_path = format!("/var/lib/monoce-os/images/{}.ext4", image_name);
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| images_dir.join("vmlinux"));
+    let rootfs_path = images_dir.join(format!("{}.ext4", image_name));
 
-    let image = VmImage::new(image_name, &kernel_path, &rootfs_path);
+    let image = VmImage::new(image_name, kernel_path, rootfs_path);
     manager.register_image(image).await;
 
     let vm_id = manager.create_vm(name, image_name, resources).await?;
@@ -106,16 +109,24 @@ async fn cmd_list() -> Result<()> {
     let storage = default_storage();
     let vms = storage.list_vms().await?;
 
-    if vms.is_empty() {
+    // Filter to VMs that have a valid config file
+    let mut valid_vms = Vec::new();
+    for vm_id in &vms {
+        if storage.config_path(vm_id).exists() {
+            valid_vms.push(vm_id.clone());
+        }
+    }
+
+    if valid_vms.is_empty() {
         println!("no VMs found");
         return Ok(());
     }
 
     println!("{:<40} {:<10}", "VM ID", "STATUS");
     println!("{}", "-".repeat(52));
-    for vm_id in vms {
-        let config_path = storage.config_path(&vm_id);
-        let status = if config_path.exists() { "created" } else { "unknown" };
+    for vm_id in valid_vms {
+        let socket = storage.socket_path(&vm_id);
+        let status = if socket.exists() { "running" } else { "stopped" };
         println!("{:<40} {:<10}", vm_id, status);
     }
     Ok(())

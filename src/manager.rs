@@ -9,6 +9,35 @@ use crate::resource::{HostCapacity, ResourceLimits};
 use crate::storage::VmStorage;
 use crate::vm::{MicroVm, VmConfig, VmId, VmState};
 
+/// File-based lock to prevent race conditions when multiple processes
+/// create VMs simultaneously.
+struct VmIndexLock {
+    _file: std::fs::File,
+}
+
+impl VmIndexLock {
+    fn acquire(storage: &VmStorage) -> OsResult<Self> {
+        let lock_path = storage.vms_dir().join(".vm-index.lock");
+        std::fs::create_dir_all(storage.vms_dir())?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        // Use flock advisory lock via libc
+        unsafe {
+            let ret = libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                libc::LOCK_EX,
+            );
+            if ret != 0 {
+                return Err(OsError::Io(std::io::Error::last_os_error()));
+            }
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 /// Central manager for all microVMs on a host.
 pub struct VmManager {
     vms: Arc<RwLock<HashMap<VmId, MicroVm>>>,
@@ -20,13 +49,47 @@ pub struct VmManager {
 
 impl VmManager {
     pub fn new(storage: VmStorage, capacity: HostCapacity) -> Self {
+        // Determine next VM index from existing VMs on disk to avoid
+        // IP/TAP collisions when the CLI is invoked as separate processes.
+        let next_index = Self::detect_next_vm_index(&storage);
+
         Self {
             vms: Arc::new(RwLock::new(HashMap::new())),
             storage,
             capacity: Arc::new(RwLock::new(capacity)),
             images: Arc::new(RwLock::new(ImageRegistry::new())),
-            next_vm_index: Arc::new(RwLock::new(0)),
+            next_vm_index: Arc::new(RwLock::new(next_index)),
         }
+    }
+
+    /// Scan existing VM configs on disk and find the highest vm_index used,
+    /// so the next VM gets a unique network assignment.
+    fn detect_next_vm_index(storage: &VmStorage) -> u32 {
+        let vms_dir = storage.vms_dir();
+        let mut max_index: Option<u32> = None;
+
+        if let Ok(entries) = std::fs::read_dir(&vms_dir) {
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let config_path = entry.path().join("vm-config.json");
+                if let Ok(data) = std::fs::read_to_string(&config_path) {
+                    if let Ok(config) = serde_json::from_str::<serde_json::Value>(&data) {
+                        // Derive the index from the TAP device name (tap0, tap1, ...)
+                        if let Some(tap) = config.pointer("/network/host_dev_name").and_then(|v| v.as_str()) {
+                            if let Some(idx_str) = tap.strip_prefix("tap") {
+                                if let Ok(idx) = idx_str.parse::<u32>() {
+                                    max_index = Some(max_index.map_or(idx, |m: u32| m.max(idx)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        max_index.map_or(0, |m| m + 1)
     }
 
     /// Register a VM image (kernel + rootfs).
@@ -51,11 +114,15 @@ impl VmManager {
         // Reserve host resources.
         self.capacity.write().await.reserve(&resources)?;
 
-        // Allocate network.
+        // Allocate network with file lock to prevent race conditions
+        // between concurrent processes.
+        let _lock = VmIndexLock::acquire(&self.storage)?;
         let vm_index = {
+            // Re-detect from disk under lock to get accurate value
+            let fresh_index = Self::detect_next_vm_index(&self.storage);
             let mut idx = self.next_vm_index.write().await;
-            let current = *idx;
-            *idx += 1;
+            let current = fresh_index.max(*idx);
+            *idx = current + 1;
             current
         };
         let network = NetworkConfig::for_vm_index(vm_index)
@@ -99,27 +166,46 @@ impl VmManager {
 
     /// Stop and destroy a microVM.
     pub async fn destroy_vm(&self, vm_id: &str) -> OsResult<()> {
-        let mut vms = self.vms.write().await;
-        let vm = vms
-            .get_mut(vm_id)
-            .ok_or_else(|| OsError::VmNotFound(vm_id.to_string()))?;
+        // Try to take the VM from the in-memory registry first.
+        let mut vm = {
+            let mut vms = self.vms.write().await;
+            if let Some(vm) = vms.remove(vm_id) {
+                vm
+            } else {
+                // Fall back to loading the VM definition from disk.
+                let cfg_path = self.storage.config_path(vm_id);
+                if !cfg_path.exists() {
+                    return Err(OsError::VmNotFound(vm_id.to_string()));
+                }
+                let cfg_data = tokio::fs::read_to_string(&cfg_path).await?;
+                let config: VmConfig = serde_json::from_str(&cfg_data)?;
+                let mut vm = MicroVm::new(config, &self.storage);
+                // If a Firecracker API socket exists, assume it's running so we can try to stop it.
+                if self.storage.socket_path(vm_id).exists() {
+                    vm.state = VmState::Running;
+                }
+                vm
+            }
+        };
 
-        // Stop VM if running.
+        // Stop VM if running or paused.
         if vm.state == VmState::Running || vm.state == VmState::Paused {
-            vm.stop().await?;
+            // Try to stop, but don't fail destroy if graceful stop fails.
+            if let Err(e) = vm.stop().await {
+                tracing::warn!(vm_id = %vm.config.vm_id, error = %e, "failed to stop VM during destroy; continuing");
+            }
         }
 
         // Release host resources.
         self.capacity.write().await.release(&vm.config.resources);
 
-        // Teardown TAP.
+        // Teardown TAP (idempotent).
         let tap = TapSetup::from_config(&vm.config.network);
-        tap.teardown().await?;
+        let _ = tap.teardown().await;
 
         // Cleanup storage.
         self.storage.cleanup_vm(vm_id).await?;
 
-        vms.remove(vm_id);
         tracing::info!(vm_id = %vm_id, "VM destroyed");
         Ok(())
     }

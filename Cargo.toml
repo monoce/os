@@ -22,6 +22,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 hex.workspace = true
+blake3.workspace = true
 libc.workspace = true
 
 [dev-dependencies]

@@ -248,8 +248,13 @@ impl MicroVm {
     /// Force-kill the Firecracker process.
     fn kill(&self) -> OsResult<()> {
         if let Some(pid) = self.pid {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
+            let ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                // ESRCH means process doesn't exist — that's fine
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(OsError::Io(err));
+                }
             }
         }
         Ok(())
@@ -270,35 +275,64 @@ impl MicroVm {
     }
 
     async fn api_put(&self, path: &str, body: &serde_json::Value) -> OsResult<()> {
-        let socket = self.socket_path.to_string_lossy().to_string();
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
         let body_str = serde_json::to_string(body)?;
+        let request = format!(
+            "PUT {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccept: */*\r\n\r\n{}",
+            path, body_str.len(), body_str
+        );
 
-        let output = tokio::process::Command::new("curl")
-            .args([
-                "--silent",
-                "--show-error",
-                "-X", "PUT",
-                "--unix-socket", &socket,
-                "--data", &body_str,
-                "-H", "Content-Type: application/json",
-                &format!("http://localhost{}", path),
-            ])
-            .output()
-            .await?;
+        let mut stream = tokio::net::UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|e| OsError::Firecracker(format!("failed to connect to API socket: {}", e)))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        stream.write_all(request.as_bytes()).await?;
+
+        // Read HTTP response incrementally (Firecracker uses Connection: keep-alive,
+        // so read_to_end would block forever).
+        let mut reader = BufReader::new(&mut stream);
+
+        // Read status line
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).await?;
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(500);
+
+        // Read headers to find Content-Length
+        let mut content_length: usize = 0;
+        loop {
+            let mut header_line = String::new();
+            reader.read_line(&mut header_line).await?;
+            if header_line.trim().is_empty() {
+                break; // End of headers
+            }
+            if let Some(val) = header_line.strip_prefix("Content-Length: ") {
+                content_length = val.trim().parse().unwrap_or(0);
+            }
+        }
+
+        // Read response body
+        let mut response_body = vec![0u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut response_body).await?;
+        }
+        let response_body = String::from_utf8_lossy(&response_body);
+
+        if status >= 400 {
             return Err(OsError::FirecrackerApi {
-                status: output.status.code().unwrap_or(-1) as u16,
-                body: stderr.to_string(),
+                status,
+                body: response_body.to_string(),
             });
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.contains("\"fault_message\"") {
+        if response_body.contains("\"fault_message\"") {
             return Err(OsError::FirecrackerApi {
                 status: 400,
-                body: stdout.to_string(),
+                body: response_body.to_string(),
             });
         }
 

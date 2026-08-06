@@ -42,6 +42,11 @@ impl VmStorage {
         }
     }
 
+    /// Directory containing all VM subdirectories.
+    pub fn vms_dir(&self) -> PathBuf {
+        self.base_path.join("vms")
+    }
+
     /// Directory for a specific VM's storage.
     pub fn vm_dir(&self, vm_id: &str) -> PathBuf {
         self.base_path.join("vms").join(vm_id)
@@ -115,10 +120,31 @@ impl VmStorage {
         Ok(dest)
     }
 
-    /// Compute the CID for a file on disk (content-addressable).
+    /// Compute the CID for a file on disk using streaming BLAKE3 hash.
     pub async fn compute_cid(&self, path: &Path) -> OsResult<Cid> {
-        let data = tokio::fs::read(path).await?;
-        Ok(Cid::from_bytes(&data, Codec::Chunk))
+        use tokio::io::AsyncReadExt;
+
+        let mut file = tokio::fs::File::open(path).await?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0u8; 64 * 1024]; // 64 KiB buffer
+
+        loop {
+            let n = file.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+
+        let hash = hasher.finalize();
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(hash.as_bytes());
+        Ok(Cid {
+            version: 1,
+            algo: monoce_common::HashAlgo::Blake3,
+            codec: Codec::Chunk,
+            digest,
+        })
     }
 
     /// Build a Firecracker drive config for the rootfs.
